@@ -1,0 +1,4 @@
+numpy
+pyaudiowpatch
+scipy
+PySide6
