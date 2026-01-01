@@ -14,172 +14,103 @@ from PySide6.QtGui import QPixmap, QFont, QColor, QPalette
 
 # --- CONFIGURACIÓN DE CLASIFICACIÓN ---
 def calculate_modal_noise_floor(db_array):
-    """
-    Calcula el piso de ruido real usando un histograma.
-    El 'room tone' es el valor que más se repite en el fondo, no simplemente el percentil 10.
-    """
+    # Calcula el piso de ruido usando histograma (Moda)
     if len(db_array) == 0: return -90.0
     
-    # Filtramos silencios digitales absolutos que falsean la medición
     valid_db = db_array[db_array > -85.0]
     if len(valid_db) < 10: return -90.0
 
-    # Creamos un histograma para encontrar el valor más frecuente (Moda)
-    # Nos centramos en la mitad inferior de los datos (donde vive el ruido)
     lower_half = valid_db[valid_db < np.percentile(valid_db, 60)]
     
-    if len(lower_half) == 0: return np.mean(valid_db) # Fallback
+    if len(lower_half) == 0: return np.mean(valid_db)
 
-    # Hacemos bins de 1dB de ancho
     hist, bins = np.histogram(lower_half, bins=int(np.ptp(lower_half)) + 1)
     
-    # El bin con más muestras es el piso de ruido estable (ej. el zumbido constante)
     max_bin_index = np.argmax(hist)
     modal_floor = (bins[max_bin_index] + bins[max_bin_index+1]) / 2
     
     return modal_floor
 
 def get_classification(noise_floor, snr, stability):
-    """
-    Clasificación robusta basada en Estándar EDE/Broadcast.
-    Prioriza la inteligibilidad (SNR) sobre el silencio absoluto.
-    """
+    # Clasificación robusta basada en EDE/Broadcast
     
-    # --- 1. GUARDIA DE SEGURIDAD (CRITERIOS GLOBALES) ---
-    # Si el SNR es pésimo (< 6dB), la voz es indistinguible del ruido.
-    # Esto atrapa susurros en Nivel 1 o ruido fuerte en Nivel 3.
-    if snr < 6.0:
-        return 4, "4. CRITICAL (Voz inaudible)", "#d50000" # Rojo Sangre
+    # 1. CRITICAL
+    if snr < 6.0: return 4, "4. CRITICAL (Voz inaudible)", "#d50000"
+    if noise_floor > -35.0: return 4, "4. CRITICAL (Saturado)", "#d50000"
 
-    # Si el ruido es ensordecedor (más fuerte que -35dB)
-    if noise_floor > -35.0:
-        return 4, "4. CRITICAL (Saturado)", "#d50000"
-
-    # --- 2. ZONA DE RIESGO (NIVEL 3) ---
-    # Aquí el SNR es vital. Si el SNR es pobre (< 15dB) aunque el piso sea "aceptable",
-    # degradamos a Nivel 3.
-    # Ajustamos el techo del Nivel 2 a -42dB como acordamos.
+    # 2. HIGH RISK
     is_noisy_floor = noise_floor > -43.0 
-    is_poor_snr = snr < 15.0 # Voz apenas destaca sobre el fondo
+    is_poor_snr = snr < 15.0 
     
     if is_noisy_floor or is_poor_snr:
-        if is_noisy_floor: reason = "Ruidoso"
-        else: reason = "Voz baja"
-        return 3, f"3. HIGH ({reason})", "#ff6d00" # Naranja
+        reason = "Ruidoso" if is_noisy_floor else "Voz baja"
+        return 3, f"3. HIGH ({reason})", "#ff6d00"
 
-    # --- 3. ZONA DE CALIDAD (NIVELES 1 y 2) ---
-    # Si llegamos aquí, el SNR es decente (>15) y el piso es < -42.
-    
-    # Nivel 2: Ruido moderado (-55 a -42)
-    # OJO: Aquí aplicamos el criterio de Estabilidad.
+    # 3. QUALITY ZONES
     if noise_floor > -55.0:
-        # Si varía mucho (golpes, ladridos), penalizamos visualmente en la etiqueta
         detail = "Constante" if stability < 4.0 else "Irregular"
-        return 2, f"2. MODERATE ({detail})", "#ffd600" # Amarillo
+        return 2, f"2. MODERATE ({detail})", "#ffd600"
 
-    # Nivel 1: Estudio (-75 a -55)
-    # Requiere EXCELENTE SNR para ser verdadero estudio.
     if snr > 25.0:
-        return 1, "1. LOW (Studio Quality)", "#00e676" # Verde Menta
+        return 1, "1. LOW (Studio Quality)", "#00e676"
     else:
-        # Si el piso es bajo pero la voz no es potente, lo dejamos en Nivel 2
-        # para no confiarte demasiado.
         return 2, "2. MODERATE (Voz suave)", "#ffd600"
 
-    # Nivel 0: Silencio Digital (Vacío)
     if noise_floor < -75.0:
-        return 0, "0. SILENT (Vacío)", "#00bfa5" # Turquesa
+        return 0, "0. SILENT (Vacío)", "#00bfa5"
 
 class NoiseCouncil:
-    """
-    Sistema de votación de 3 rutas para determinar el ruido de fondo real.
-    """
-    
+    # Sistema de votación de 3 rutas para determinar el ruido de fondo real.
     @staticmethod
     def evaluate(audio_buffer):
-        """
-        Recibe un buffer de audio (lista o numpy array de floats).
-        Devuelve: (noise_db_final, details_dict)
-        """
-        if len(audio_buffer) == 0:
-            return -90.0, {}
+        if len(audio_buffer) == 0: return -90.0, {}
 
-        # Convertir a numpy array y asegurar limpieza
         data = np.array(audio_buffer)
-        # Filtramos silencio digital absoluto (-inf) o errores
         data = data[data > -100] 
-        
         if len(data) < 10: return -90.0, {}
 
-        # --- JUEZ 1: EL ESTADÍSTICO (MODA) ---
-        # Busca el valor más frecuente en la mitad inferior (donde vive el ruido)
+        # 1. Juez Modal (Estadístico)
         try:
-            # Tomamos solo los datos por debajo de la media para ignorar la voz
             lower_half = data[data < np.mean(data)]
             if len(lower_half) > 0:
-                # Histograma de 1dB de ancho
                 hist, bins = np.histogram(lower_half, bins=int(np.ptp(lower_half)) + 1)
                 max_bin = np.argmax(hist)
-                # El valor central del bin más alto
                 vote_modal = (bins[max_bin] + bins[max_bin+1]) / 2
             else:
                 vote_modal = np.percentile(data, 10)
         except:
             vote_modal = np.percentile(data, 10)
 
-        # --- JUEZ 2: EL SEGREGADOR (VAD ENERGÉTICO) ---
-        # Define un umbral dinámico. Todo lo que esté 15dB abajo del pico es "posible ruido".
+        # 2. Juez VAD (Segregador)
         try:
             p95_voice = np.percentile(data, 95)
-            threshold = p95_voice - 20.0 # Margen de seguridad
-            
-            # Aislar muestras que son puramente ruido (silencio)
+            threshold = p95_voice - 20.0
             noise_samples = data[data < threshold]
             
-            if len(noise_samples) > len(data) * 0.1: # Si tenemos al menos 10% de silencio
-                vote_vad = np.mean(noise_samples) # Promedio de SOLO el silencio
+            if len(noise_samples) > len(data) * 0.1:
+                vote_vad = np.mean(noise_samples)
             else:
-                # Si la persona no paró de hablar, usamos el P5 como fallback
                 vote_vad = np.percentile(data, 5)
         except:
             vote_vad = -90.0
 
-        # --- JUEZ 3: EL PESIMISTA (P5 ABSOLUTO) ---
-        # El piso más bajo confiable (evitando outliers de -infinito)
+        # 3. Juez Pesimista (P5)
         vote_p5 = np.percentile(data, 5)
 
-        # --- EL VEREDICTO (CONSENSO PONDERADO) ---
-        # Si la Modal (Juez 1) es mucho más alta que el P5 (Juez 3), 
-        # significa que hay un ruido constante fuerte (ej. ventilador).
-        # Si están cerca, el ambiente es limpio.
-        
+        # Consenso
         judges = [vote_modal, vote_vad, vote_p5]
-        
-        # Lógica de Consenso:
-        # Descartamos valores absurdos (ej. si el VAD falló y dio muy alto)
-        # Nos quedamos con la mediana para evitar extremos.
         consensus = np.median(judges)
         
-        # AJUSTE DE SEGURIDAD:
-        # Si el "Modal" (ruido constante) es el más alto, suele ser la verdad más dolorosa.
-        # (El ruido que el usuario va a escuchar sí o sí).
+        # Ajuste de seguridad
         if vote_modal > consensus:
             final_noise = (consensus + vote_modal) / 2
         else:
             final_noise = consensus
 
-        return final_noise, {
-            "Moda": vote_modal,
-            "VAD": vote_vad,
-            "P5": vote_p5
-        }
+        return final_noise, {"Moda": vote_modal, "VAD": vote_vad, "P5": vote_p5}
 
 class StyleCouncil:
-    """
-    Sistema de votación para determinar la naturalidad de la voz.
-    Evalúa: Dinámica (Volumen), Ritmo (Velocidad) y Fluidez (Pausas).
-    """
-    
+    # Sistema de votación para determinar naturalidad (Dinámica, Ritmo, Fluidez)
     @staticmethod
     def evaluate(db_values):
         if not db_values or len(db_values) < 5:
@@ -187,24 +118,11 @@ class StyleCouncil:
 
         arr = np.array(db_values)
         
-        # --- JUEZ 1: EL MÚSICO (DINÁMICA) ---
-        # ¿Qué tanto varía el volumen? (Desviación Estándar)
-        # Robot: < 2.5 dB (Muy plano)
-        # Leído: 2.5 - 4.5 dB (Controlado)
-        # Natural: > 4.5 dB (Expresivo)
+        # 1. Dinámica (Desviación Estándar)
         std_dev = np.std(arr)
+        score_dynamics = 2 if std_dev > 4.5 else (1 if std_dev > 2.5 else 0)
         
-        score_dynamics = 0 # 0=Robot, 1=Leído, 2=Natural
-        if std_dev > 4.5: score_dynamics = 2
-        elif std_dev > 2.5: score_dynamics = 1
-        
-        # --- JUEZ 2: EL BATERISTA (RITMO) ---
-        # Detectamos "golpes" de voz (picos) y medimos si son regulares.
-        # cv (Coeficiente de Variación) = std_intervalos / media_intervalos
-        # Robot/Leído: Ritmo regular (CV bajo < 0.25)
-        # Natural: Ritmo caótico/rubato (CV alto > 0.25)
-        
-        # Altura mínima para considerar que es una sílaba y no ruido
+        # 2. Ritmo (Coeficiente de Variación de Picos)
         height_thresh = np.percentile(arr, 20) + 5 
         peaks, _ = signal.find_peaks(arr, height=height_thresh, distance=2)
         
@@ -214,54 +132,32 @@ class StyleCouncil:
             if np.mean(intervals) > 0:
                 rhythm_cv = np.std(intervals) / np.mean(intervals)
         
-        score_rhythm = 0
-        if rhythm_cv > 0.35: score_rhythm = 2  # Muy irregular (charla)
-        elif rhythm_cv > 0.18: score_rhythm = 1 # Algo estructurado (lectura)
-        # Si es < 0.18 es muy probable que sea robótico o lectura monótona
+        score_rhythm = 2 if rhythm_cv > 0.35 else (1 if rhythm_cv > 0.18 else 0)
         
-        # --- JUEZ 3: EL GRAMÁTICO (FLUIDEZ) ---
-        # "Fill Ratio": Porcentaje de tiempo que hay sonido vs silencio.
-        # Robot: No respira (Fill > 90%)
-        # Leído: Respira en comas (Fill 70-85%)
-        # Natural: Piensa y duda (Fill < 70% o micro-pausas)
-        
+        # 3. Fluidez (Ratio de relleno)
         p80 = np.percentile(arr, 80)
-        threshold_silence = p80 - 15 # Umbral relativo
+        threshold_silence = p80 - 15 
         active_samples = np.sum(arr > threshold_silence)
         fill_ratio = active_samples / len(arr)
         
-        score_flow = 0
-        if fill_ratio < 0.75: score_flow = 2 # Natural (muchas pausas/aire)
-        elif fill_ratio < 0.90: score_flow = 1 # Leído (pausas controladas)
-        # > 0.90 es un bloque de sonido continuo (sospechoso)
+        score_flow = 2 if fill_ratio < 0.75 else (1 if fill_ratio < 0.90 else 0)
 
-        # --- VEREDICTO FINAL (SUMA DE VOTOS) ---
-        # Sumamos los puntos (0 a 6 posibles)
+        # Veredicto
         total_score = score_dynamics + score_rhythm + score_flow
         
-        final_style = "Desconocido"
-        color = "#888"
-        
-        # TABLA DE RESULTADOS
-        # 0-1: Muy artificial
         if total_score <= 1:
             final_style = "🤖 ROBÓTICO / PLANO"
-            color = "#ff1744" # Rojo
+            color = "#ff1744"
             reason = "Tono monótono y ritmo fijo"
-            
-        # 2-3: Estructurado
         elif total_score <= 3:
             final_style = "📖 LEÍDO / FORMAL"
-            color = "#ffd740" # Amarillo
+            color = "#ffd740"
             reason = "Buena dicción, ritmo pautado"
-            
-        # 4-6: Espontáneo
         else:
             final_style = "🗣️ NATURAL / ESPONTÁNEO"
-            color = "#00e676" # Verde
+            color = "#00e676"
             reason = "Variación tonal y rítmica alta"
 
-        # Depuración para ti (para ver qué juez falló)
         debug_info = f"DYN({score_dynamics}) RYTH({score_rhythm}) FLOW({score_flow})"
         
         return {
@@ -459,11 +355,18 @@ class CacatuaWindow(QMainWindow):
         layout.addLayout(header)
 
         # Device
+        lbl_source = QLabel("Fuente de Sonido:")
+        lbl_source.setStyleSheet("color: #00e676; font-weight: bold; margin-bottom: 2px;")
+        layout.addWidget(lbl_source)
+
         self.combo_dev = QComboBox()
         self.combo_dev.setStyleSheet("background-color: #222; color: white; padding: 5px; border: 1px solid #444;")
         self.refresh_devices()
         self.combo_dev.currentIndexChanged.connect(self.start_thread)
         layout.addWidget(self.combo_dev)
+
+        if self.combo_dev.count() > 0:
+            self.start_thread(0)
 
         # Meter
         self.level_bar = QProgressBar()
@@ -548,16 +451,16 @@ class CacatuaWindow(QMainWindow):
 
     def refresh_devices(self):
         self.combo_dev.clear()
-        self.combo_dev.addItem("Selecciona Loopback...", -1)
         p = pyaudio.PyAudio()
         try:
             for i in range(p.get_device_count()):
                 d = p.get_device_info_by_index(i)
+                # Filtramos por Loopback/Stereo Mix per preferencia del usuario
                 if d['maxInputChannels'] > 0 and ("loopback" in d['name'].lower() or "stereomix" in d['name'].lower()):
                     self.combo_dev.addItem(f"🔄 {d['name']}", i)
-            # Fallback
-            if self.combo_dev.count() == 1:
-                self.combo_dev.addItem("⚠️ Mostrar Todos (No Loopback Found)", -2)
+            
+            if self.combo_dev.count() == 0:
+                self.combo_dev.addItem("⚠️ Mostrar Todos (No Loopback Encontrado)", -2)
         finally:
             p.terminate()
 
