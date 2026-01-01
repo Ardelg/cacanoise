@@ -43,6 +43,16 @@ Automáticamente realizará las siguientes tareas la primera vez que se ejecute:
 
 Para ejecuciones posteriores, el script detectará que todo está listo y abrirá la aplicación inmediatamente.
 
+### Configuración de Audio (Importante)
+
+El programa funciona como un **"espía de audio"** pasivo. No interviene, modifica ni se conecta directamente a otras aplicaciones (Google Meet, Zoom, etc.). Simplemente escucha lo que sale por tus parlantes o auriculares.
+
+*   **Selección de Fuente**: En el menú desplegable "Fuente de Sonido", debes elegir el dispositivo **por donde TÚ estás escuchando el audio**.
+    *   🎧 Si estás usando **auriculares**, selecciona tus auriculares en la lista.
+    *   🔊 Si estás usando **parlantes**, selecciona los parlantes.
+
+**Nota**: La herramienta usa la función "Loopback" para capturar el audio del sistema tal cual lo escuchas tú.
+
 ---
 
 ## Solución de Problemas

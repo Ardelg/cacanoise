@@ -40,7 +40,7 @@ echo.
 
 REM === Ejecutar la app ===
 echo Iniciando Cacatua Noise...
-python main_optimized.py
+python cacatuanoise.py
 set "EXITCODE=%ERRORLEVEL%"
 
 if not "%EXITCODE%"=="0" (
