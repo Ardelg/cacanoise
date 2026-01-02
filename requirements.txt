@@ -5,3 +5,4 @@ PySide6
 webrtcvad
 librosa
 setuptools
+pyqtgraph

@@ -9,6 +9,7 @@ import librosa
 import numpy as np
 import webrtcvad
 import struct
+import pyqtgraph as pg
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QLabel, QProgressBar, QGroupBox, 
                                QComboBox, QPushButton, QCheckBox, QStackedWidget,
@@ -35,35 +36,66 @@ def calculate_modal_noise_floor(db_array):
 
 def get_classification(noise_floor, snr, voice_p90):
     """
-    Clasificación ajustada a calibración:
-    - SNR Alto (> 35) = LVL 0 (Estudio)
-    - SNR Bajo (< 11) = LVL 4 (Calle)
+    Clasificación con ZONAS FRONTERIZAS (Borderline) para reducir subjetividad.
+    Se han creado márgenes de +/- 1.5 a 2 dB en los puntos de corte.
     """
     
-    # 1. CASO SILENCIO O MICRÓFONO APAGADO
-    if voice_p90 < -50.0: 
+    # 0. CASO SIN SEÑAL
+    if voice_p90 < -55.0: 
         return 0, "SIN SEÑAL / MUTE", "#607d8b"
 
-    # 2. LVL 4: RUIDO EXTREMO (Calle, Viento, Obra)
-    # Tus pruebas dieron SNR 14.1 para esto.
-    if snr < 11.0:
-        return 4, "LVL 4: RUIDOSO (Calle/Viento)", "#d50000" # ROJO
+    # --- ZONA ROJA (Mala Calidad) ---
+    
+    # LVL 4 PURO (SNR < 13)
+    # Antes cortabas en 15. Ahora < 13 es indiscutiblemente malo.
+    if snr < 13.0:
+        return 4, "LVL 4: RUIDOSO (Indiscutible)", "#d50000" # Rojo Intenso
 
-    # 3. LVL 3: RUIDO ALTO (Oficina ruidosa, Café)
-    if snr < 20.0:
-        return 3, "LVL 3: RUIDO NOTABLE", "#ff6d00" # NARANJA
+    # BORDE 4/3 (SNR 13 - 17)
+    # Zona gris alrededor del antiguo 15.
+    if snr < 17.0:
+        return 3.5, "⚠️ LVL 4/3: BORDE (Muy Ruidoso)", "#ff3d00" # Rojo-Naranja
 
-    # 4. LVL 2: ESTÁNDAR (Ambiente casero normal)
-    if snr < 35.0:
-        return 2, "LVL 2: ACEPTABLE", "#ffd600" # AMARILLO
+    # --- ZONA NARANJA (Ruido Notable) ---
 
-    # 5. LVL 1: BUENO (Habitación silenciosa)
-    if snr < 56.0:
-        return 1, "LVL 1: BUENO", "#64dd17" # VERDE CLARO
+    # LVL 3 PURO (SNR 17 - 18.5)
+    # Rango estrecho donde claramente es ruido de oficina fuerte pero no calle.
+    if snr < 18.5:
+        return 3, "LVL 3: RUIDO NOTABLE", "#ff6d00" # Naranja
 
-    # 6. LVL 0: ESTUDIO (Silencio absoluto de fondo)
-    # Tus pruebas dieron SNR 59.4 para esto.
-    return 0, "LVL 0: ESTUDIO (Perfecto)", "#00e676" # VERDE NEÓN
+    # BORDE 3/2 (SNR 18.5 - 22.5)
+    # Zona gris alrededor del antiguo 20. ¿Es ventilador fuerte o normal?
+    if snr < 22.5:
+        return 2.5, "⚠️ LVL 3/2: BORDE (Ruidoso/Medio)", "#ffab00" # Naranja-Amarillo
+
+    # --- ZONA AMARILLA (Aceptable) ---
+
+    # LVL 2 PURO (SNR 22.5 - 33)
+    # El estándar casero.
+    if snr < 33.0:
+        return 2, "LVL 2: ACEPTABLE (Estándar)", "#ffd600" # Amarillo
+
+    # BORDE 2/1 (SNR 33 - 37)
+    # Zona gris alrededor del antiguo 35. ¿Es casero o casi estudio?
+    if snr < 37.0:
+        return 1.5, "⚠️ LVL 2/1: BORDE (Muy Bueno)", "#c6ff00" # Amarillo-Lima
+
+    # --- ZONA VERDE (Buena Calidad) ---
+
+    # LVL 1 PURO (SNR 37 - 54)
+    # Habitación silenciosa.
+    if snr < 54.0:
+        return 1, "LVL 1: BUENO (Silencioso)", "#64dd17" # Verde Lima
+
+    # BORDE 1/0 (SNR 54 - 58)
+    # Zona gris alrededor del antiguo 56. ¿Es silencio o silencio absoluto?
+    if snr < 58.0:
+        return 0.5, "✨ LVL 1/0: BORDE (Casi Perfecto)", "#00e676" # Verde Neón suave
+
+    # --- ZONA PERFECTA ---
+    
+    # LVL 0 PURO (SNR > 58)
+    return 0, "💎 LVL 0: ESTUDIO (Perfecto)", "#00c853" # Verde Intenso
 
 class TitanCouncil:
     @staticmethod
@@ -141,6 +173,7 @@ class AudioAnalysisThread(QThread):
     test_finished = Signal(dict) 
     phrase_started = Signal()
     phrase_finished = Signal(dict)
+    visual_data = Signal(np.ndarray)
 
     def __init__(self, device_idx):
         super().__init__()
@@ -162,89 +195,96 @@ class AudioAnalysisThread(QThread):
 
     def run(self):
         p = pyaudio.PyAudio()
+        stream = None
         try:
+            # --- CORRECCIÓN 1: Pequeña pausa para que el driver de audio despierte ---
+            time.sleep(0.2) 
+            
             info = p.get_device_info_by_index(self.idx)
             rate = int(info["defaultSampleRate"])
-            ch = int(info["maxInputChannels"]) or 1
-            chunk = int(rate * 0.1) # 100ms
+            # Forzamos 2 canales si es loopback para evitar errores
+            ch = info["maxInputChannels"] if info["maxInputChannels"] > 0 else 2
+            
+            chunk_ms = 100 
+            chunk = int(rate * chunk_ms / 1000) # Esto suele dar ~4800 muestras
             
             stream = p.open(format=pyaudio.paInt16, channels=ch, rate=rate, input=True, 
                             input_device_index=self.idx, frames_per_buffer=chunk)
 
             while self.running:
-                data = stream.read(chunk, exception_on_overflow=False)
-                arr = np.frombuffer(data, dtype=np.int16)
-                
-                arr_float = arr.astype(np.float32) / 32768.0
-                
-                rms = np.sqrt(np.mean(arr_float**2))
-                db = 20 * np.log10(rms + 1e-9)
-                self.level_update.emit(db)
-
-                if db > -50: 
-                    if db < self.local_min: self.local_min = db
-                    if db > self.local_max: self.local_max = db
-                self.gauge_update.emit(db, self.local_min, self.local_max, self.is_speaking)
-                
-                curr_time = time.time()
-
-                if db > -55: 
-                    self.last_speech_time = curr_time
+                try:
+                    # Lectura segura
+                    raw_data = stream.read(chunk, exception_on_overflow=False)
                     
-                    if not self.is_speaking:
-                        self.is_speaking = True
-                        self.speech_start_time = curr_time
-                        
-                        self.event_db = list(self.pre_roll_db)
-                        self.event_raw = list(self.pre_roll_raw)
-                        
-                        self.phrase_started.emit()
-
-                    self.event_db.append(db)
-                    self.event_raw.append(arr_float)
-
-                else:
-                    if self.is_speaking:
+                    # SI LLEGA VACÍO (Pasa mucho con Loopback en silencio), saltamos
+                    if not raw_data: 
+                        time.sleep(0.01) # Pequeña siesta para no quemar CPU
+                        continue 
+                    
+                    # Conversión y resto del código...
+                    arr_int16 = np.frombuffer(raw_data, dtype=np.int16)
+                    # ... (sigue tu código normal)
+                    arr_float = arr_int16.astype(np.float32) / 32768.0
+                    
+                    # --- CORRECCIÓN 2: Enviar copia segura al gráfico ---
+                    if len(arr_float) > 0:
+                        self.visual_data.emit(arr_float.copy())
+                    
+                    # Calcular dB para la aguja
+                    rms = np.sqrt(np.mean(arr_float**2))
+                    db = 20 * np.log10(rms + 1e-9)
+                    
+                    self.level_update.emit(db)
+                    self.gauge_update.emit(db, self.local_min, self.local_max, self.is_speaking)
+                    
+                    curr_time = time.time()
+                    if db > -55:
+                        self.last_speech_time = curr_time
+                        if not self.is_speaking:
+                            self.is_speaking = True
+                            self.speech_start_time = curr_time
+                            self.event_db = list(self.pre_roll_db)
+                            self.event_raw = list(self.pre_roll_raw)
+                            self.phrase_started.emit()
                         self.event_db.append(db)
                         self.event_raw.append(arr_float)
-                        
-                        if (curr_time - self.last_speech_time) > 1.5:
-                            duration = self.last_speech_time - self.speech_start_time
-                            
-                            if duration > 0.5:
-                                if len(self.event_raw) > 0:
-                                    full_audio_chunk = np.concatenate(self.event_raw)
-                                    
-                                    piso, snr, voz = TitanCouncil.evaluate(full_audio_chunk, sample_rate=rate)
-
-                                    self.test_finished.emit({
-                                        "p10": piso,
-                                        "p90": voz,
-                                        "snr": snr,
-                                        "stability": 0,
-                                        "duration": duration
-                                    })
-                                
-                                prosody_data = StyleCouncil.evaluate(self.event_db)
-                                prosody_data["duration"] = duration
-                                self.phrase_finished.emit(prosody_data)
-                            
-                            self.is_speaking = False
-                            self.event_db = []
-                            self.event_raw = []
-                            self.local_min = 0 
-                            self.local_max = -90
-
                     else:
-                        self.pre_roll_db.append(db)
-                        self.pre_roll_raw.append(arr_float)
+                        if self.is_speaking:
+                            self.event_db.append(db)
+                            self.event_raw.append(arr_float)
+                            if (curr_time - self.last_speech_time) > 1.5:
+                                duration = self.last_speech_time - self.speech_start_time
+                                if duration > 0.5:
+                                    if len(self.event_raw) > 0:
+                                        full_audio = np.concatenate(self.event_raw)
+                                        piso, snr, voz = TitanCouncil.evaluate(full_audio, rate)
+                                        self.test_finished.emit({
+                                            "p10": piso, "p90": voz, "snr": snr, 
+                                            "duration": duration, "stability": 0
+                                        })
+                                        prosody = StyleCouncil.evaluate(full_audio, rate)
+                                        prosody["duration"] = duration
+                                        self.phrase_finished.emit(prosody)
+                                self.is_speaking = False
+                                self.event_db = []
+                                self.event_raw = []
+                        else:
+                            self.pre_roll_db.append(db)
+                            self.pre_roll_raw.append(arr_float)
 
-        except Exception as e: print(f"Error Thread: {e}")
-        finally: p.terminate()
+                except Exception:
+                    continue # Si falla un frame, no rompas el programa
+
+        except Exception as e:
+            print(f"ERROR: {e}")
+        finally:
+            if stream: stream.close()
+            p.terminate()
 
     def stop(self):
         self.running = False
-        self.wait()
+        # self.wait()  <--- ¡BORRA O COMENTA ESTA LÍNEA! ES LA CAUSA DEL CONGELAMIENTO.
+        # Al quitarla, la interfaz no se bloqueará esperando a un micrófono que no responde.
 
     def reset_state(self):
         self.event_db = []
@@ -254,60 +294,280 @@ class AudioAnalysisThread(QThread):
         self.is_speaking = False
 
 class StyleCouncil:
+    """
+    StyleCouncil V2: Detector de Humanidad basado en Caos y Frecuencia Fundamental.
+    Distingue: Robot (Plano) vs Leído (Rítmico) vs Natural (Caótico).
+    """
     @staticmethod
-    def evaluate(db_values):
-        if not db_values or len(db_values) < 5:
-            return {"style": "Insuficiente", "color": "#888", "details": "Muy corto"}
+    def evaluate(audio_float, sample_rate=32000):
+        # Mínimo de muestras para análisis fiable
+        if len(audio_float) < sample_rate * 0.5:
+            return {"score": 0, "label": "...", "color": "#444", "metrics": [0, 0, 0]}
 
-        arr = np.array(db_values)
+        y = np.array(audio_float)
         
-        std_dev = np.std(arr)
-        score_dynamics = 2 if std_dev > 4.5 else (1 if std_dev > 2.5 else 0)
+        # --- 1. ANÁLISIS DE TONO (F0 / Pitch) ---
+        # Usamos YIN para detectar la frecuencia fundamental (la vibración de la garganta)
+        # Solo analizamos frecuencias de voz humana (50Hz a 300Hz) para filtrar ruido
+        f0 = librosa.yin(y, fmin=50, fmax=300, sr=sample_rate)
         
-        height_thresh = np.percentile(arr, 20) + 5 
-        peaks, _ = signal.find_peaks(arr, height=height_thresh, distance=2)
+        # Limpiamos NaN (donde no detectó tono)
+        f0_clean = f0[~np.isnan(f0)]
         
-        rhythm_cv = 0
-        if len(peaks) > 2:
-            intervals = np.diff(peaks)
-            if np.mean(intervals) > 0:
-                rhythm_cv = np.std(intervals) / np.mean(intervals)
-        
-        score_rhythm = 2 if rhythm_cv > 0.35 else (1 if rhythm_cv > 0.18 else 0)
-        
-        p80 = np.percentile(arr, 80)
-        threshold_silence = p80 - 15 
-        active_samples = np.sum(arr > threshold_silence)
-        fill_ratio = active_samples / len(arr)
-        
-        score_flow = 2 if fill_ratio < 0.75 else (1 if fill_ratio < 0.90 else 0)
-
-        total_score = score_dynamics + score_rhythm + score_flow
-        
-        if total_score <= 1:
-            final_style = "🤖 ROBÓTICO / PLANO"
-            color = "#ff1744"
-            reason = "Tono monótono y ritmo fijo"
-        elif total_score <= 3:
-            final_style = "📖 LEÍDO / FORMAL"
-            color = "#ffd740"
-            reason = "Buena dicción, ritmo pautado"
+        if len(f0_clean) < 10:
+            # Si no hay tono detectable, es susurro o ruido
+            pitch_variability = 0
         else:
-            final_style = "🗣️ NATURAL / ESPONTÁNEO"
-            color = "#00e676"
-            reason = "Variación tonal y rítmica alta"
+            # Calculamos la excursión semitonal (qué tanto sube y baja la voz musicalmente)
+            # Una voz robótica varía menos de 2 semitonos. Una natural varía más de 5.
+            pitch_std = np.std(f0_clean)
+            pitch_variability = min(100, (pitch_std / 20.0) * 100) # Normalizamos (20Hz std es muy alto)
 
-        debug_info = f"DYN({score_dynamics}) RYTH({score_rhythm}) FLOW({score_flow})"
+        # --- 2. ANÁLISIS DE ARTIFICIALIDAD (Spectral Flatness) ---
+        # La voz sintética suele tener "residuos" digitales o armónicos demasiado perfectos.
+        # La planitud espectral mide qué tan parecido al ruido blanco es el sonido.
+        flatness = librosa.feature.spectral_flatness(y=y)[0]
+        # La voz humana natural tiene una planitud baja (muchos picos armónicos).
+        # El ruido o vocoders malos tienen planitud alta.
+        avg_flatness = np.mean(flatness)
+        organic_score = 100 - min(100, avg_flatness * 500) # Invertimos: Más planitud = Menos orgánico
+
+        # --- 3. ANÁLISIS DE RITMO (Predicibilidad) ---
+        # Detectamos los golpes de voz (sílabas)
+        onset_env = librosa.onset.onset_strength(y=y, sr=sample_rate)
         
+        # Autocorrelación: Vemos si el patrón de volumen se repite a sí mismo (LEÍDO/PAUTEADO)
+        # Si la señal se parece mucho a sí misma desplazada, es rítmica (mala señal para naturalidad)
+        ac = librosa.autocorrelate(onset_env, max_size=sample_rate // 2) # Analizamos hasta 0.5s de lag
+        
+        # El pico de autocorrelación (descartando el lag 0) nos dice qué tan repetitiva es
+        if len(ac) > 1:
+            rhythm_repetitiveness = np.max(ac[1:]) / (ac[0] + 1e-9) # Normalizado
+        else:
+            rhythm_repetitiveness = 0
+            
+        # Invertimos: Más repetitivo = Menos espontáneo
+        spontaneity_score = 100 - min(100, rhythm_repetitiveness * 150)
+
+        # --- LÓGICA DE DECISIÓN (ÁRBOL DE DECISIÓN) ---
+        
+        # Métricas para el gráfico [Melodía, Humanidad, Espontaneidad]
+        metrics = [pitch_variability, organic_score, spontaneity_score]
+        
+        label = "---"
+        color = "#888"
+        total_score = np.mean(metrics)
+
+        # 1. DETECTOR DE ROBOT (Falta de tono o tono muy plano)
+        if pitch_variability < 15:
+            label = "🤖 ROBÓTICO / PLANO"
+            color = "#ff1744" # Rojo Intenso
+            total_score = 10 # Penalización fuerte
+
+        # 2. DETECTOR DE LECTURA (Tono varía, pero ritmo muy repetitivo)
+        elif spontaneity_score < 40:
+            label = "📖 LEÍDO / PAUTEADO"
+            color = "#ff9100" # Naranja
+            
+        # 3. DETECTOR DE DRAMATIZACIÓN (Demasiada variación de tono artificial)
+        elif pitch_variability > 90:
+            label = "🎭 SOBREACTUADO"
+            color = "#d500f9" # Violeta
+
+        # 4. ZONA NATURAL
+        elif total_score > 60:
+            label = "🗣️ NATURAL / FLUIDO"
+            color = "#00e676" # Verde
+            
+        else:
+            label = "😐 FORMAL / SERIO"
+            color = "#ffd600" # Amarillo
+
         return {
-            "style": final_style,
-            "style_color": color,
-            "reason": reason,
-            "debug": debug_info,
-            "metrics": f"CV:{rhythm_cv:.2f} SD:{std_dev:.1f}"
+            "score": total_score,
+            "label": label,
+            "color": color,
+            "metrics": metrics
         }
 
+class NaturalnessRadar(QWidget):
+    def __init__(self):
+        super().__init__()
+        # Aumentamos tamaño mínimo
+        self.setMinimumSize(250, 220)
+        self.metrics = [0, 0, 0] 
+        self.max_metrics = [0, 0, 0] # Memoria de picos
+        
+        # --- CAMBIO AQUÍ: ETIQUETAS MÁS PRECISAS ---
+        # Melodía: ¿Varía el tono? (No es robot)
+        # Orgánico: ¿Suena humano? (No es sintético)
+        # Caos: ¿Es irregular? (No es leído)
+        self.labels = ["MELODÍA", "ORGÁNICO", "CAOS"]
 
+    def set_metrics(self, metrics_list):
+        self.metrics = metrics_list
+        # Actualizamos la sombra: toma el máximo entre lo que había y lo nuevo
+        self.max_metrics = [max(o, n) for o, n in zip(self.max_metrics, metrics_list)]
+        self.update()
+
+    def reset_shadow(self):
+        # Llamar esto cuando empiece una nueva frase si quieres limpiar la sombra
+        self.max_metrics = [0, 0, 0]
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        w, h = self.width(), self.height()
+        center = QPointF(w/2, h/2 + 10)
+        radius = min(w, h) / 2 - 35 # Un poco más de margen para textos
+
+        # 1. FONDO (Triángulo Base)
+        painter.setPen(QPen(QColor("#333"), 1))
+        painter.setBrush(Qt.NoBrush)
+        
+        angles = [-90, 30, 150] 
+        base_poly = QPolygonF()
+        points_100 = []
+        for a in angles:
+            rad = np.radians(a)
+            p = QPointF(center.x() + radius * np.cos(rad), center.y() + radius * np.sin(rad))
+            points_100.append(p)
+            base_poly.append(p)
+        
+        painter.drawPolygon(base_poly)
+        for p in points_100: painter.drawLine(center, p)
+
+        # 2. DIBUJAR SOMBRA (MÁXIMOS) - Gris transparente
+        max_poly = QPolygonF()
+        for i, angle in enumerate(angles):
+            val = self.max_metrics[i] / 100.0
+            val = max(0.05, val)
+            rad = np.radians(angle)
+            p = QPointF(center.x() + (radius * val) * np.cos(rad), center.y() + (radius * val) * np.sin(rad))
+            max_poly.append(p)
+        
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 30)) # Blanco muy transparente
+        painter.drawPolygon(max_poly)
+
+        # 3. DIBUJAR VALORES ACTUALES - Color vivo
+        data_poly = QPolygonF()
+        for i, angle in enumerate(angles):
+            val = self.metrics[i] / 100.0
+            val = max(0.05, val)
+            rad = np.radians(angle)
+            p = QPointF(center.x() + (radius * val) * np.cos(rad), center.y() + (radius * val) * np.sin(rad))
+            data_poly.append(p)
+        
+        avg_score = sum(self.metrics) / 3
+        if avg_score > 60: col = QColor(0, 230, 118, 180) 
+        elif avg_score > 35: col = QColor(255, 214, 0, 180)
+        else: col = QColor(255, 23, 68, 180)
+
+        painter.setPen(QPen(col.lighter(), 2))
+        painter.setBrush(col)
+        painter.drawPolygon(data_poly)
+
+        # 4. ETIQUETAS
+        painter.setPen(QColor("#aaa"))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        offsets = [(0, -20), (25, 10), (-35, 10)]
+        
+        for i, p in enumerate(points_100):
+            # Posición etiqueta
+            txt_rect = QRectF(p.x() + offsets[i][0] - 30, p.y() + offsets[i][1] - 10, 80, 20)
+            painter.drawText(txt_rect, Qt.AlignCenter, self.labels[i])
+            
+            # Valor numérico
+            val_rect = QRectF(txt_rect.x(), txt_rect.y() + 14, 80, 20)
+            painter.setPen(col.lighter())
+            painter.drawText(val_rect, Qt.AlignCenter, f"{int(self.metrics[i])}%")
+            painter.setPen(QColor("#aaa"))
+
+
+
+
+class AudioVisualizer(QWidget):
+    def __init__(self):
+        super().__init__()
+        # AUMENTO DE TAMAÑO: Forzamos una altura mínima mayor
+        self.setMinimumHeight(300) 
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        pg.setConfigOption('background', '#121212')
+        pg.setConfigOption('foreground', '#888')
+
+        # --- Gráfico 1: Onda (Osciloscopio) ---
+        self.wave_plot = pg.PlotWidget(title="Monitor de Onda")
+        self.wave_plot.setYRange(-1, 1)
+        self.wave_plot.showGrid(x=False, y=True, alpha=0.2)
+        self.wave_plot.setMouseEnabled(x=False, y=False)
+        self.wave_plot.hideAxis('bottom')
+        self.wave_plot.hideAxis('left')
+        self.wave_plot.getPlotItem().hideButtons()
+        
+        # Curva principal (Verde neón brillante)
+        self.wave_curve = self.wave_plot.plot(pen=pg.mkPen('#00e676', width=2))
+        layout.addWidget(self.wave_plot)
+
+        # --- Gráfico 2: Espectro (FFT) ---
+        self.fft_plot = pg.PlotWidget(title="Espectro de Frecuencia")
+        self.fft_plot.setLogMode(x=True, y=False)
+        self.fft_plot.setYRange(0, 1) # Mantenemos 0-1 pero multiplicaremos la señal
+        self.fft_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.fft_plot.setMouseEnabled(x=False, y=False)
+        self.fft_plot.hideAxis('left')
+        self.fft_plot.getPlotItem().hideButtons()
+        
+        # Curva de "Sombra" (Máximos históricos) - Gris oscuro transparente
+        self.fft_max_curve = self.fft_plot.plot(pen=pg.mkPen('#444', width=1), fillLevel=0, brush=(100, 100, 100, 30))
+        # Curva Principal - Azul eléctrico
+        self.fft_curve = self.fft_plot.plot(pen=pg.mkPen('#2979ff', width=2), fillLevel=0, brush=(41, 121, 255, 80))
+        
+        layout.addWidget(self.fft_plot)
+
+        # Buffers
+        self.data_buffer = np.zeros(10000)
+        self.fft_max_buffer = None # Se inicializa dinámicamente
+
+    def update_data(self, audio_chunk):
+        if audio_chunk is None or len(audio_chunk) == 0: return
+
+        chunk_len = len(audio_chunk)
+        
+        # 1. MONITOR DE ONDA
+        if chunk_len > len(self.data_buffer):
+            self.data_buffer = np.zeros(chunk_len * 2)
+        
+        self.data_buffer = np.roll(self.data_buffer, -chunk_len)
+        self.data_buffer[-chunk_len:] = audio_chunk
+        self.wave_curve.setData(self.data_buffer)
+
+        # 2. ESPECTRO (FFT) MEJORADO
+        try:
+            fft_data = np.fft.rfft(audio_chunk)
+            # SENSIBILIDAD: Multiplicamos por 25 para que las barras suban más
+            fft_mag = (np.abs(fft_data) / chunk_len) * 25
+            
+            # Inicializar buffer de sombra si es necesario
+            if self.fft_max_buffer is None or len(self.fft_max_buffer) != len(fft_mag):
+                self.fft_max_buffer = np.zeros_like(fft_mag)
+            
+            # CÁLCULO DE SOMBRA:
+            # El buffer máximo decae lentamente (x 0.95) o sube si el nuevo valor es mayor
+            self.fft_max_buffer = np.maximum(self.fft_max_buffer * 0.92, fft_mag)
+            
+            x_axis = np.linspace(20, 20000, len(fft_mag))
+            
+            # Dibujamos primero la sombra (atrás) y luego la señal (frente)
+            self.fft_max_curve.setData(x_axis, self.fft_max_buffer)
+            self.fft_curve.setData(x_axis, fft_mag)
+            
+        except Exception:
+            pass 
 
 
 class GaugeWidget(QWidget):
@@ -315,108 +575,86 @@ class GaugeWidget(QWidget):
         super().__init__(parent)
         self.setMinimumSize(250, 200) 
         self.current_db = -90
-        self.min_trace = -90
-        self.max_trace = -90
-        self.is_active = False
+        
+        self.history = deque(maxlen=50) 
+        self.peak_hold = -90
 
-    def update_values(self, current, min_val, max_val, active):
-        self.current_db = max(-90, min(0, current))
-        self.min_trace = max(-90, min(0, min_val))
-        self.max_trace = max(-90, min(0, max_val))
-        self.is_active = active
+    def update_values(self, current_db):
+        self.current_db = max(-90, min(0, current_db))
+        self.history.append(self.current_db)
+        
+        if self.current_db > self.peak_hold:
+            self.peak_hold = self.current_db
+        else:
+            self.peak_hold -= 0.5 
+            
         self.update()
+
+    def get_angle_for_db(self, db_value):
+        """Convierte dB (-90 a 0) en Grados Qt (180 a 0)"""
+        # Aseguramos límites
+        val = max(-90, min(0, db_value))
+        # Mapeo: -90 -> 180, 0 -> 0.
+        # Fórmula lineal: angle = -2 * val
+        return -2 * val
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-
         w, h = self.width(), self.height()
         center = QPointF(w / 2, h * 0.85) 
         radius = min(w, h * 2) / 2 - 25
 
-        grad_bg = QConicalGradient(center, -90)
-        grad_bg.setColorAt(0, QColor("#1a1a1a"))
-        grad_bg.setColorAt(1, QColor("#2a2a2a"))
+        # 1. FONDO NEGRO
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#111"))
         painter.drawPie(QRectF(center.x() - radius, center.y() - radius, radius * 2, radius * 2), 0, 180 * 16)
 
+        # 2. ESCALA (Rayitas)
         painter.save()
         painter.translate(center)
+        # No rotamos el canvas entero, rotaremos cada línea individualmente
         
-        total_ticks = 45 
-        for i in range(total_ticks + 1):
-            val_db = -90 + (90 * (i / total_ticks)) 
-            
-            angle = 2 * val_db 
+        for i in range(0, 91, 2): # De 0 a 90 (que representa -90 a 0 dB)
+            db_val = -90 + i
+            angle = self.get_angle_for_db(db_val)
             
             painter.save()
-            painter.rotate(angle) 
+            # Nota: Qt rota en sentido horario por defecto. 
+            # Como nuestros ángulos van de 180 (izq) a 0 (der), 
+            # necesitamos rotar -angle para ir "hacia arriba/izquierda"
+            painter.rotate(-angle) 
             
-            if val_db > -15: tick_color = QColor("#ff1744") 
-            elif val_db > -35: tick_color = QColor("#ff9100")
-            elif val_db > -50: tick_color = QColor("#ffea00")
-            else: tick_color = QColor("#00e676")
+            # Color según severidad
+            if db_val > -10: c = QColor("#d50000") # Rojo
+            elif db_val > -25: c = QColor("#ff6d00")
+            elif db_val > -45: c = QColor("#ffd600")
+            else: c = QColor("#00c853") # Verde
             
-            is_major = (i % 5 == 0)
-            length = 15 if is_major else 8
-            width = 3 if is_major else 1
-            
-            painter.setPen(QPen(tick_color, width))
-            painter.drawLine(int(radius - length), 0, int(radius), 0)
-            
-            if is_major:
-                font = QFont("Segoe UI", 8, QFont.Bold)
-                painter.setFont(font)
-                painter.setPen(QColor("#888"))
-                text_radius = radius - 30
-            
+            is_major = (db_val % 10 == 0)
+            painter.setPen(QPen(c, 3 if is_major else 1))
+            painter.drawLine(int(radius - (15 if is_major else 8)), 0, int(radius), 0)
             painter.restore()
         painter.restore()
 
-        if self.is_active and self.max_trace > self.min_trace:
-            rect = QRectF(center.x() - (radius-5), center.y() - (radius-5), (radius-5) * 2, (radius-5) * 2)
-            angle_min = -2 * self.min_trace
-            angle_max = -2 * self.max_trace
-            
-            start = int(angle_min * 16) 
-            span = int((angle_max - angle_min) * 16)
-            
-            pen_trace = QPen(QColor(255, 255, 255, 40), 10) 
-            pen_trace.setCapStyle(Qt.FlatCap)
-            painter.setPen(pen_trace)
-            painter.drawArc(rect, start, span)
-
+        # 3. AGUJA
         painter.save()
         painter.translate(center)
-        painter.rotate(2 * self.current_db) 
+        # Usamos la misma función de ángulo
+        curr_angle = self.get_angle_for_db(self.current_db)
+        painter.rotate(-curr_angle) 
         
-        painter.setBrush(QColor("#ff3d00")) 
+        painter.setBrush(QColor("#ff3d00"))
         painter.setPen(Qt.NoPen)
-        
-        needle = QPolygonF([
-            QPointF(0, -2), 
-            QPointF(radius - 5, 0), 
-            QPointF(0, 2),
-            QPointF(-10, 0)
-        ])
+        # Dibujamos la aguja apuntando a la derecha (0 grados), la rotación se encarga del resto
+        needle = QPolygonF([QPointF(0, -3), QPointF(radius - 5, 0), QPointF(0, 3)])
         painter.drawPolygon(needle)
-        
-        painter.setBrush(QColor("#222"))
-        painter.setPen(QPen(QColor("#444"), 2))
-        painter.drawEllipse(QPointF(0,0), 8, 8)
-        
         painter.restore()
 
+        # 4. TEXTO
         painter.setPen(QColor("white"))
-        painter.setFont(QFont("Consolas", 22, QFont.Bold))
-        text_rect = QRectF(center.x() - 60, center.y() - 60, 120, 40)
-        painter.drawText(text_rect, Qt.AlignCenter, f"{self.current_db:.1f}")
-        
-        painter.setFont(QFont("Segoe UI", 10))
-        painter.setPen(QColor("#888"))
-        unit_rect = QRectF(center.x() - 60, center.y() - 25, 120, 20)
-        painter.drawText(unit_rect, Qt.AlignCenter, "dB FS")
+        painter.setFont(QFont("Consolas", 24, QFont.Bold))
+        painter.drawText(QRectF(center.x()-50, center.y()-50, 100, 40), Qt.AlignCenter, f"{self.current_db:.1f}")
 
 class CacatuaWindow(QMainWindow):
     def __init__(self):
@@ -486,62 +724,87 @@ class CacatuaWindow(QMainWindow):
 
         self.combo_dev = QComboBox()
         self.combo_dev.setStyleSheet("background-color: #222; color: white; padding: 5px; border: 1px solid #444;")
+        # self.refresh_devices()  <-- MOVIDO MAS ABAJO
+        # self.combo_dev.currentIndexChanged.connect(self.start_thread) <-- MOVIDO MAS ABAJO
+        layout.addWidget(self.combo_dev)
+        
+        # LAYOUT HORIZONTAL PRINCIPAL
+        main_h_layout = QHBoxLayout()
+        
+        # IZQUIERDA: Medidores Visuales
+        left_panel = QVBoxLayout()
+        self.gauge = GaugeWidget()
+        left_panel.addWidget(self.gauge, alignment=Qt.AlignCenter)
+        
+        # Dashboard Gráfico
+        self.visualizer = AudioVisualizer() 
+        # Quitamos setFixedSize para que se expanda, o le damos un mínimo generoso
+        self.visualizer.setMinimumSize(420, 300) 
+        left_panel.addWidget(self.visualizer)
+        
+        # AHORA SÍ INICIALIZAMOS DISPOSITIVOS (Porque start_thread usa self.visualizer)
         self.refresh_devices()
         self.combo_dev.currentIndexChanged.connect(self.start_thread)
-        layout.addWidget(self.combo_dev)
+        
+        main_h_layout.addLayout(left_panel)
 
-        self.gauge = GaugeWidget()
-        layout.addWidget(self.gauge, alignment=Qt.AlignCenter)
-
-        if self.combo_dev.count() > 0:
-            self.start_thread(0)
-
-        # Meter
-        self.level_bar = QProgressBar()
-        self.level_bar.setRange(-90, 0)
-        self.level_bar.setTextVisible(False)
-        self.level_bar.setFixedHeight(20)
-        self.level_bar.setStyleSheet("""
-            QProgressBar { background-color: #222; border: 1px solid #444; border-radius: 10px; }
-            QProgressBar::chunk { background-color: #00e676; border-radius: 10px; }
-        """)
-        layout.addWidget(self.level_bar)
-
-        dur_group = QGroupBox("Análisis de Voz (Prosodia)")
+        # DERECHA: Datos y Textos
+        right_panel = QVBoxLayout()
+        
+        # --- SECTION: VOICE DURATION & QUICK STATUS ---
+        # --- SECTION: VOICE DURATION & QUICK STATUS ---
+        dur_group = QGroupBox("Análisis de Prosodia")
         dur_layout = QVBoxLayout()
         
-        hbox = QHBoxLayout()
+        h_voz = QHBoxLayout()
+        
+        # Izquierda: Textos
+        v_textos = QVBoxLayout()
         self.lbl_duration = QLabel("0.00 s")
         self.lbl_duration.setStyleSheet("font-size: 40px; font-weight: bold; color: white;")
-        hbox.addWidget(self.lbl_duration)
         
         self.lbl_style = QLabel("---")
         self.lbl_style.setAlignment(Qt.AlignCenter)
         self.lbl_style.setFixedSize(200, 40)
         self.lbl_style.setStyleSheet("font-size: 14px; background-color: #333; color: #aaa; border-radius: 4px;")
-        hbox.addWidget(self.lbl_style)
-        dur_layout.addLayout(hbox)
         
-        self.lbl_prosody_details = QLabel("Dinamismo: -- | Ritmo (CV): --")
-        self.lbl_prosody_details.setStyleSheet("color: #aaa; margin-top: 5px;")
-        dur_layout.addWidget(self.lbl_prosody_details)
-
+        v_textos.addWidget(self.lbl_duration)
+        v_textos.addWidget(self.lbl_style)
+        v_textos.addStretch()
+        h_voz.addLayout(v_textos)
+        
+        # Derecha: EL NUEVO RADAR
+        self.radar = NaturalnessRadar()
+        h_voz.addWidget(self.radar)
+        
+        dur_group.setLayout(h_voz)
+        
+        # Detalles ocultos o extras
+        self.lbl_prosody_details = QLabel("") 
+        
+        # AQUÍ AÑADIMOS EL NIVEL DE RUIDO (Resultado del último test)
         self.lbl_result_mini = QLabel("Nivel de Ambiente: PENDIENTE DE TEST")
         self.lbl_result_mini.setAlignment(Qt.AlignCenter)
         self.lbl_result_mini.setStyleSheet("color: #777; font-style: italic; margin-top: 5px;")
-        dur_layout.addWidget(self.lbl_result_mini)
+        
+        # Como dur_group ahora tiene layout horizontal, añadimos estos widgets al layout principal de la derecha
+        # O podemos meterlos en el v_textos si queremos que estén juntos
+        v_textos.addWidget(self.lbl_result_mini)
+        
+        right_panel.addWidget(dur_group)
 
-        dur_group.setLayout(dur_layout)
-        layout.addWidget(dur_group)
 
+        # --- SECTION: 30s ANALYSIS (HIDDEN BUT STRUCTURED) ---
         test_group = QGroupBox("Certificación de Entorno (Continuo)")
         test_layout = QVBoxLayout()
         
+        # Status Label
         self.lbl_test_status = QLabel("Esperando voz para certificar...")
         self.lbl_test_status.setAlignment(Qt.AlignCenter)
         self.lbl_test_status.setStyleSheet("color: #00e676; font-size: 12px; font-style: italic;")
         test_layout.addWidget(self.lbl_test_status)
-
+        
+        # RESULTADOS DETALLADOS
         self.res_widget = QWidget()
         res_layout = QFormLayout(self.res_widget)
         
@@ -555,7 +818,12 @@ class CacatuaWindow(QMainWindow):
         test_layout.addWidget(self.res_widget)
         
         test_group.setLayout(test_layout)
-        layout.addWidget(test_group)
+        right_panel.addWidget(test_group)
+        
+        main_h_layout.addLayout(right_panel)
+        layout.addLayout(main_h_layout)
+
+
         
         layout.addStretch()
 
@@ -567,18 +835,49 @@ class CacatuaWindow(QMainWindow):
         self.show()
 
     def refresh_devices(self):
+        self.combo_dev.blockSignals(True)
         self.combo_dev.clear()
+        
         p = pyaudio.PyAudio()
         try:
+            # 1. Intentamos obtener el Loopback por defecto de Windows
+            default_loopback = None
+            try:
+                # Esta función es exclusiva de la librería pyaudiowpatch
+                default_info = p.get_default_wasapi_loopback()
+                default_loopback = default_info
+            except OSError:
+                pass # No se pudo determinar el default
+            
+            target_index = -1
+            
+            # 2. Llenamos la lista SOLO con Loopbacks
             for i in range(p.get_device_count()):
                 d = p.get_device_info_by_index(i)
-                if d['maxInputChannels'] > 0 and ("loopback" in d['name'].lower() or "stereomix" in d['name'].lower()):
+                
+                # Filtro estricto: Debe ser input y tener "loopback" en el nombre
+                if d['maxInputChannels'] > 0 and "loopback" in d['name'].lower():
                     self.combo_dev.addItem(f"🔄 {d['name']}", i)
+                    
+                    # Si es el que Windows dice que es el default, guardamos su índice del combo
+                    if default_loopback and d['index'] == default_loopback['index']:
+                        target_index = self.combo_dev.count() - 1
             
-            if self.combo_dev.count() == 0:
-                self.combo_dev.addItem("⚠️ Mostrar Todos (No Loopback Encontrado)", -2)
+            # 3. Selección Automática Inteligente
+            if target_index >= 0:
+                self.combo_dev.setCurrentIndex(target_index)
+            elif self.combo_dev.count() > 0:
+                self.combo_dev.setCurrentIndex(0) # Si no hay default, elige el primero
+            else:
+                self.combo_dev.addItem("⚠️ No se detectó Audio del Sistema", -1)
+
         finally:
             p.terminate()
+            self.combo_dev.blockSignals(False)
+            
+            # Opcional: Iniciar automáticamente si se encontró uno válido
+            if self.combo_dev.count() > 0 and self.combo_dev.currentData() >= 0:
+                self.start_thread(self.combo_dev.currentIndex())
 
     def start_thread(self, index):
         data = self.combo_dev.currentData()
@@ -593,13 +892,14 @@ class CacatuaWindow(QMainWindow):
         if data is not None and data >= 0:
             if self.analysis_thread: self.analysis_thread.stop()
             self.analysis_thread = AudioAnalysisThread(data)
-            self.analysis_thread.level_update.connect(lambda db: self.level_bar.setValue(int(db)))
+            # self.analysis_thread.level_update.connect(lambda db: self.level_bar.setValue(int(db)))
             self.analysis_thread.phrase_started.connect(self.on_phrase_start)
             self.analysis_thread.phrase_finished.connect(self.on_phrase_end)
             
             self.analysis_thread.test_finished.connect(self.update_certification)
             
-            self.analysis_thread.gauge_update.connect(self.gauge.update_values)
+            self.analysis_thread.gauge_update.connect(lambda cur, min_v, max_v, act: self.gauge.update_values(cur))
+            self.analysis_thread.visual_data.connect(self.visualizer.update_data)
             
             self.analysis_thread.start()
 
@@ -607,18 +907,19 @@ class CacatuaWindow(QMainWindow):
         self.lbl_style.setText("HABLANDO...")
         self.lbl_style.setStyleSheet("background-color: #444; color: white; font-size: 14px; border-radius: 4px; padding: 5px;")
 
-    def on_phrase_end(self, data):
-        dur = data["duration"]
+    def on_phrase_end(self, d):
+        dur = d["duration"]
         self.lbl_duration.setText(f"{dur:.2f} s")
         
-        style = data["style"]
-        color = data["style_color"]
-        self.lbl_style.setText(style)
+        label = d.get("label", "---") # Usamos .get por si acaso
+        color = d.get("color", "#888")
+        
+        self.lbl_style.setText(label)
         self.lbl_style.setStyleSheet(f"background-color: {color}; color: #000; font-weight: bold; border-radius: 4px; padding: 5px;")
         
-        self.lbl_prosody_details.setText(
-            f"{data['reason']} | {data['metrics']}"
-        )
+        # ACTUALIZAR RADAR
+        if "metrics" in d:
+            self.radar.set_metrics(d["metrics"])
 
     def run_test(self):
         # Deprecated
@@ -650,7 +951,7 @@ class CacatuaWindow(QMainWindow):
         
         self.lbl_test_status.setText("Analizando ventana de 30s en tiempo real...")
         self.res_widget.setVisible(False)
-        self.level_bar.setValue(-90)
+        # self.level_bar.setValue(-90)
 
         if self.analysis_thread:
             self.analysis_thread.reset_state()
