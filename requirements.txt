@@ -2,3 +2,6 @@ numpy
 pyaudiowpatch
 scipy
 PySide6
+webrtcvad
+librosa
+setuptools
