@@ -1,61 +1,31 @@
-# Cacatua Noise
+# 🦜 Cacatua Noise
 
-**Cacatua Noise** es una herramienta avanzada de análisis de audio diseñada para monitorear y certificar la calidad del entorno sonoro en tiempo real. Utiliza algoritmos de procesamiento de señal y estadísticas ponderadas ("Noise Council") para ofrecer métricas precisas sobre el ruido de fondo, la relación señal-ruido (SNR) y la prosodia de la voz.
+Herramienta interna para validar calidad de micrófono y ruido de fondo. Corta.
 
----
+## 🚀 Ejecución
+Simplemente dale doble click a **`cacatuanoise.bat`**.
 
-## ⚠️ Aviso Importante (Disclaimer)
+El script se encarga de instalar dependencias y levantar la app solo.
 
-**Esta herramienta tiene fines exclusivamente de apoyo técnico y métrico.**
+## 🎚️ Calibración (Ajuste de VARA)
+Si sienten que el criterio está muy exigente o muy regalón:
 
-Los resultados mostrados por el software **NO representan una evaluación definitiva** ni reemplazan el criterio profesional. La evaluación definitiva de la calidad del audio se basa indispensablemente en **escuchar atentamente** y utilizar la percepción humana para distinguir con precisión los matices entre la voz del usuario y el ruido de fondo.
+1.  Abran `cacatuanoise.py`.
+2.  Busquen `def get_classification` (aprox línea 36).
+3.  Ajusten los números del SNR según necesiten:
 
-Esta aplicación sirve como una guía cuantitativa para ayudar a identificar problemas, pero el oído humano es el juez final.
+```python
+    if snr < 11.0: return 4 # Calle / Moto
+    if snr < 20.0: return 3 # Cafetería / Ruido alto - Aquí fui un poco más exigente que el ejemplo de lvl 3, porque no está realmente dificil de entender ese audio.
+    if snr < 35.0: return 2 # Casa normal (Aceptable)
+    if snr < 56.0: return 1 # Bueno
+    # Lo que sobra es LVL 0 (Estudio)
+```
 
----
+## 🛠️ Estructura (Para cuando metan mano)
+*   **`TitanCouncil`**: El cerebro. Usa **WebRTC VAD** (Modo 3) + **Librosa**. Recibe audio RAW `float32`.
+*   **`StyleCouncil`**: Mide "dinámica" y "ritmo" (evita que suenen robóticos).
+*   **`AudioAnalysisThread`**: Maneja **Doble Buffer** (uno en `dB` para la UI, otro en `Raw` para el análisis de Titan).
 
-## Requisitos Previos
-
-Para utilizar Cacatua Noise, es necesario tener instalado **Python** en su sistema operativo.
-
-*   📥 **Descargar Python**: [https://www.python.org/downloads/](https://www.python.org/downloads/)
-
-*Asegúrese de marcar la casilla "Add Python to PATH" durante la instalación.*
-
----
-
-## Instrucciones de Instalación y Uso
-
-El proyecto está diseñado para ser "Plug & Play" mediante el script de automatización incluido. No es necesario abrir terminales ni configurar entornos manualmente.
-
-### Pasos para iniciar:
-
-1.  Descargue o clone este repositorio en su computadora.
-2.  Ubique el archivo **`cacatuanoise.bat`** en la carpeta principal.
-3.  Haga **doble clic** sobre `cacatuanoise.bat`.
-
-### ¿Qué hace el script?
-Automáticamente realizará las siguientes tareas la primera vez que se ejecute:
-1.  Verificará si Python está instalado.
-2.  Creará un entorno virtual aislado (`.venv`) para no afectar su sistema.
-3.  Instalará todas las librerías necesarias (`requirements.txt`).
-4.  Iniciará la aplicación **Cacatua Noise**.
-
-Para ejecuciones posteriores, el script detectará que todo está listo y abrirá la aplicación inmediatamente.
-
-### Configuración de Audio (Importante)
-
-El programa funciona como un **"espía de audio"** pasivo. No interviene, modifica ni se conecta directamente a otras aplicaciones (Google Meet, Zoom, etc.). Simplemente escucha lo que sale por tus parlantes o auriculares.
-
-*   **Selección de Fuente**: En el menú desplegable "Fuente de Sonido", debes elegir el dispositivo **por donde TÚ estás escuchando el audio**.
-    *   🎧 Si estás usando **auriculares**, selecciona tus auriculares en la lista.
-    *   🔊 Si estás usando **parlantes**, selecciona los parlantes.
-
-**Nota**: La herramienta usa la función "Loopback" para capturar el audio del sistema tal cual lo escuchas tú.
-
----
-
-## Solución de Problemas
-
-*   **Si el archivo .bat se cierra inmediatamente**: Intente ejecutarlo desde una ventana de CMD para ver el error. Generalmente se debe a que Python no está instalado o no se agregó al PATH.
-*   **Si falta alguna librería**: Puede forzar la reinstalación ejecutando el script desde la terminal con el comando: `cacatuanoise.bat --reinstall`
+## ⚠️ Ojo al Piojo
+*   **Si todo da "Estudio" (LVL 0)**: Seguramente tienen activada la cancelación de ruido por hardware (Nvidia Broadcast, Krisp, etc). La app mide lo que le llega (usa el audio loopback).
