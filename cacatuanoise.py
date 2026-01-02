@@ -60,7 +60,7 @@ def get_classification(noise_floor, snr, voice_p90):
         return 2, "LVL 2: ACEPTABLE", "#ffd600" # AMARILLO
 
     # 5. LVL 1: BUENO (Habitación silenciosa)
-    if snr < 50.0:
+    if snr < 56.0:
         return 1, "LVL 1: BUENO", "#64dd17" # VERDE CLARO
 
     # 6. LVL 0: ESTUDIO (Silencio absoluto de fondo)
